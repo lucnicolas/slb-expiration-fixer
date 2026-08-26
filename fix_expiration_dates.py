@@ -80,7 +80,10 @@ class SlbClient:
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = f"{self.base_url}{path}"
-        resp = self.session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
+        try:
+            resp = self.session.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
+        except requests.exceptions.RequestException as exc:
+            raise SlbApiError(f"{method} {path} -> erreur reseau ({exc})") from exc
         if not resp.ok:
             detail = resp.text
             try:
@@ -122,17 +125,23 @@ class SlbClient:
     def search_open_validate_workcases(self) -> list[dict]:
         """Recupere tous les dossiers state=OPEN dont l'etape courante correspond
         exactement au libelle de validation configure."""
-        filter_expr = f'(state=={STATE_FILTER});(currentStepNames=="{self.step_name}")'
+        step_name = _rsql_escape(self.step_name)
+        filter_expr = f'(state=={STATE_FILTER});(currentStepNames=="{step_name}")'
         return self._search_workcases(filter_expr)
 
-    def search_expired_workcases(self) -> list[dict]:
-        """Recupere tous les dossiers state=EXPIRED.
+    def search_expired_workcases(self, expired_since: datetime | None = None) -> list[dict]:
+        """Recupere les dossiers state=EXPIRED, optionnellement bornes aux
+        expirations survenues a partir de `expired_since` (borne server-side,
+        pour eviter de re-telecharger l'integralite de l'historique EXPIRED du
+        tenant a chaque appel - celui-ci ne fait que croitre jusqu'a purge SLB).
 
         Note : `state==EXPIRED` seul declenche un bug cote API SLB (400 "Cannot
         read properties of undefined"). Une 2e clause de filtre est necessaire ;
         `currentStepNames==*` matche tout (y compris vide) et evite le bug."""
-        filter_expr = f"(state=={EXPIRED_STATE});(currentStepNames==*)"
-        return self._search_workcases(filter_expr)
+        clauses = [f"(state=={EXPIRED_STATE})", "(currentStepNames==*)"]
+        if expired_since is not None:
+            clauses.append(f"(expirationDate>={format_slb_datetime(expired_since)})")
+        return self._search_workcases(";".join(clauses))
 
     def get_workcase_status(self, external_id: str) -> str:
         resp = self._request("GET", f"/api/v3/workcases/{external_id}")
@@ -149,8 +158,17 @@ class SlbClient:
         )
 
 
-def parse_slb_datetime(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+def _rsql_escape(value: str) -> str:
+    """Echappe les guillemets doubles pour une insertion sure dans une valeur
+    de filtre RSQL entre guillemets (ex: currentStepNames=="...")."""
+    return value.replace('"', '\\"')
+
+
+def parse_slb_datetime(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
 
 
 def format_slb_datetime(value: datetime) -> str:
@@ -168,7 +186,7 @@ def parse_reception_date(external_id: str) -> date | None:
         return None
 
 
-def find_candidates(client: SlbClient, workcases: list[dict]) -> list[Candidate]:
+def find_candidates(workcases: list[dict]) -> list[Candidate]:
     candidates: list[Candidate] = []
     for wc in workcases:
         external_id = wc["externalWorkcaseName"]
@@ -183,6 +201,13 @@ def find_candidates(client: SlbClient, workcases: list[dict]) -> list[Candidate]
 
         threshold_date = reception_date + timedelta(days=RECEPTION_THRESHOLD_DAYS)
         current_expiration = parse_slb_datetime(wc["expirationDate"])
+        if current_expiration is None:
+            log.warning(
+                "%s : date d'expiration '%s' illisible, dossier ignore.",
+                external_id,
+                wc.get("expirationDate"),
+            )
+            continue
 
         if current_expiration.date() <= threshold_date:
             candidates.append(
@@ -196,16 +221,33 @@ def find_candidates(client: SlbClient, workcases: list[dict]) -> list[Candidate]
     return candidates
 
 
+REGRESSION_ACTIONS = {"StartCollectStep", "RefuseFolder", "ReopenWorkcase"}
+
+
 def reached_validate_step(history_events: list[dict]) -> bool:
-    """True si le dossier a reellement atteint l'etape de validation avant
-    d'expirer (evenement StartValidateStep present dans son historique).
+    """True si le dossier a reellement atteint l'etape de validation et y est
+    reste jusqu'a expiration (dernier evenement StartValidateStep de
+    l'historique non suivi d'un retour en arriere - refus, reouverture, ou
+    nouveau passage en collecte).
 
     Ce signal est necessaire car, une fois un dossier EXPIRED, son champ
     `currentStepNames` est vide et son `status` (COMPLETE/WITH_ERRORS) peut
     aussi bien correspondre a un dossier abandonne par l'usager avant
     soumission finale (documents deposes et notes automatiquement, mais
-    jamais soumis) qu'a un dossier reellement passe en validation."""
-    return any(ev.get("action") == VALIDATE_STEP_ACTION for ev in history_events)
+    jamais soumis) qu'a un dossier reellement passe en validation.
+    L'historique SLB est retourne par ordre chronologique."""
+    last_validate_index = None
+    for i, ev in enumerate(history_events):
+        if ev.get("action") == VALIDATE_STEP_ACTION:
+            last_validate_index = i
+
+    if last_validate_index is None:
+        return False
+
+    return not any(
+        ev.get("action") in REGRESSION_ACTIONS
+        for ev in history_events[last_validate_index + 1 :]
+    )
 
 
 def find_expired_validate_alerts(
@@ -214,13 +256,13 @@ def find_expired_validate_alerts(
     """Dossiers passes EXPIRED recemment qui avaient deja atteint l'etape de
     validation - cas anormal a traiter manuellement (etat terminal, non
     corrigeable via l'API)."""
-    workcases = client.search_expired_workcases()
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    workcases = client.search_expired_workcases(expired_since=cutoff)
 
     alerts: list[ExpiredAlert] = []
     for wc in workcases:
         expiration_date = parse_slb_datetime(wc["expirationDate"])
-        if expiration_date < cutoff:
+        if expiration_date is None or expiration_date < cutoff:
             continue
 
         external_id = wc["externalWorkcaseName"]
@@ -267,7 +309,23 @@ def confirm_and_compute(client: SlbClient, candidates: list[Candidate]) -> list[
             )
             continue
 
-        c.new_expiration = c.current_expiration + timedelta(days=EXTENSION_DAYS)
+        computed_expiration = c.current_expiration + timedelta(days=EXTENSION_DAYS)
+        # Garde-fou : si le job n'a pas tourne depuis longtemps, current_expiration
+        # peut deja etre dans le passe, et +15 jours pourrait l'y laisser -> l'API
+        # rejette (403 INVALID_EXPIRATION_DATE, date doit etre >= aujourd'hui).
+        floor = datetime.now(timezone.utc) + timedelta(days=1)
+        if computed_expiration < floor:
+            log.warning(
+                "%s : expiration actuelle (%s) + %d jours retombe encore dans le "
+                "passe, nouvelle date forcee a %s au lieu de %s.",
+                c.external_id,
+                c.current_expiration.isoformat(),
+                EXTENSION_DAYS,
+                floor.isoformat(),
+                computed_expiration.isoformat(),
+            )
+            computed_expiration = floor
+        c.new_expiration = computed_expiration
         confirmed.append(c)
     return confirmed
 
@@ -275,11 +333,11 @@ def confirm_and_compute(client: SlbClient, candidates: list[Candidate]) -> list[
 def run(apply: bool) -> int:
     load_dotenv()
     base_url = os.environ.get("SLB_BASE_URL", "https://cd-vaucluse.slfb.itesoft.cloud")
-    access_token = os.environ.get("SLB_ACCESS_TOKEN")
+    access_token = (os.environ.get("SLB_ACCESS_TOKEN") or "").strip()
     step_name = os.environ.get("SLB_VALIDATE_STEP_NAME", "Valider les justificatifs")
 
     if not access_token:
-        log.error("SLB_ACCESS_TOKEN manquant (voir .env.example).")
+        log.error("SLB_ACCESS_TOKEN manquant ou vide (voir .env.example).")
         return 2
 
     client = SlbClient(base_url, access_token, step_name)
@@ -295,7 +353,7 @@ def run(apply: bool) -> int:
 
     log.info("%d dossier(s) trouve(s) a l'etape de validation.", len(workcases))
 
-    date_candidates = find_candidates(client, workcases)
+    date_candidates = find_candidates(workcases)
     log.info(
         "%d dossier(s) avec une expiration <= reception + %d jours.",
         len(date_candidates),
@@ -347,6 +405,10 @@ def run(apply: bool) -> int:
         expired_alerts = []
 
     if expired_alerts:
+        details = ", ".join(
+            f"{a.external_id} (ecart={a.gap_days}j)" if a.gap_days is not None else a.external_id
+            for a in expired_alerts
+        )
         log.warning(
             "ALERTE : %d dossier(s) sont passes EXPIRED alors qu'ils avaient deja "
             "atteint l'etape '%s' (fenetre %d jours) - etat terminal, NON corrigeable "
@@ -355,7 +417,7 @@ def run(apply: bool) -> int:
             len(expired_alerts),
             step_name,
             EXPIRED_ALERT_LOOKBACK_DAYS,
-            ", ".join(a.external_id for a in expired_alerts),
+            details,
         )
     else:
         log.info(
@@ -385,7 +447,14 @@ def main() -> int:
         help="Applique reellement les corrections (par defaut : dry-run).",
     )
     args = parser.parse_args()
-    return run(apply=args.apply)
+    try:
+        return run(apply=args.apply)
+    except Exception:
+        # Filet de securite : un crash inattendu (bug non anticipe) doit rester
+        # distinguable, dans la supervision cron, d'un simple echec de mise a
+        # jour (code 1) ou d'un probleme de configuration/recherche (code 2).
+        log.exception("Erreur inattendue, arret du script.")
+        return 3
 
 
 if __name__ == "__main__":
