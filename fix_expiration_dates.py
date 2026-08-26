@@ -30,7 +30,10 @@ from dotenv import load_dotenv
 RECEPTION_THRESHOLD_DAYS = 16
 EXTENSION_DAYS = 15
 STATE_FILTER = "OPEN"
+EXPIRED_STATE = "EXPIRED"
 ALLOWED_STATUSES = {"COMPLETE", "WITH_ERRORS"}  # valeurs reelles renvoyees par l'API (la doc dit "COMPLETED"/"INCOMPLETED", la realite dit "COMPLETE"/"INCOMPLETE")
+VALIDATE_STEP_ACTION = "StartValidateStep"  # evenement d'historique marquant l'entree reelle dans l'etape de validation
+EXPIRED_ALERT_LOOKBACK_DAYS = 2  # fenetre de detection quotidienne des dossiers EXPIRED a signaler (marge de securite d'un jour)
 ID_PATTERN = re.compile(r"^\w+_(\d{8})_\d+$")
 REQUEST_TIMEOUT = 30
 SEARCH_PAGE_SIZE = 200
@@ -58,6 +61,14 @@ class Candidate:
     new_expiration: datetime | None = None
 
 
+@dataclass
+class ExpiredAlert:
+    external_id: str
+    reception_date: date | None
+    expiration_date: datetime
+    gap_days: int | None
+
+
 class SlbClient:
     def __init__(self, base_url: str, access_token: str, step_name: str):
         self.base_url = base_url.rstrip("/")
@@ -80,12 +91,9 @@ class SlbClient:
             raise SlbApiError(f"{method} {path} -> HTTP {resp.status_code} ({detail})")
         return resp
 
-    def search_open_validate_workcases(self) -> list[dict]:
-        """Recupere tous les dossiers state=OPEN dont l'etape courante correspond
-        exactement au libelle de validation configure."""
+    def _search_workcases(self, filter_expr: str) -> list[dict]:
         results: list[dict] = []
         seen: set[str] = set()
-        filter_expr = f'(state=={STATE_FILTER});(currentStepNames=="{self.step_name}")'
         for page in range(MAX_SEARCH_PAGES):
             resp = self._request(
                 "GET",
@@ -111,9 +119,28 @@ class SlbClient:
             )
         return results
 
+    def search_open_validate_workcases(self) -> list[dict]:
+        """Recupere tous les dossiers state=OPEN dont l'etape courante correspond
+        exactement au libelle de validation configure."""
+        filter_expr = f'(state=={STATE_FILTER});(currentStepNames=="{self.step_name}")'
+        return self._search_workcases(filter_expr)
+
+    def search_expired_workcases(self) -> list[dict]:
+        """Recupere tous les dossiers state=EXPIRED.
+
+        Note : `state==EXPIRED` seul declenche un bug cote API SLB (400 "Cannot
+        read properties of undefined"). Une 2e clause de filtre est necessaire ;
+        `currentStepNames==*` matche tout (y compris vide) et evite le bug."""
+        filter_expr = f"(state=={EXPIRED_STATE});(currentStepNames==*)"
+        return self._search_workcases(filter_expr)
+
     def get_workcase_status(self, external_id: str) -> str:
         resp = self._request("GET", f"/api/v3/workcases/{external_id}")
         return resp.json()["workcase"]["status"]
+
+    def get_workcase_history(self, external_id: str) -> list[dict]:
+        resp = self._request("GET", f"/api/v3/workcases/{external_id}/history/")
+        return resp.json()
 
     def update_expiration_date(self, external_id: str, new_expiration: datetime) -> None:
         payload = {"expirationDate": format_slb_datetime(new_expiration)}
@@ -167,6 +194,57 @@ def find_candidates(client: SlbClient, workcases: list[dict]) -> list[Candidate]
                 )
             )
     return candidates
+
+
+def reached_validate_step(history_events: list[dict]) -> bool:
+    """True si le dossier a reellement atteint l'etape de validation avant
+    d'expirer (evenement StartValidateStep present dans son historique).
+
+    Ce signal est necessaire car, une fois un dossier EXPIRED, son champ
+    `currentStepNames` est vide et son `status` (COMPLETE/WITH_ERRORS) peut
+    aussi bien correspondre a un dossier abandonne par l'usager avant
+    soumission finale (documents deposes et notes automatiquement, mais
+    jamais soumis) qu'a un dossier reellement passe en validation."""
+    return any(ev.get("action") == VALIDATE_STEP_ACTION for ev in history_events)
+
+
+def find_expired_validate_alerts(
+    client: SlbClient, lookback_days: int
+) -> list[ExpiredAlert]:
+    """Dossiers passes EXPIRED recemment qui avaient deja atteint l'etape de
+    validation - cas anormal a traiter manuellement (etat terminal, non
+    corrigeable via l'API)."""
+    workcases = client.search_expired_workcases()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+
+    alerts: list[ExpiredAlert] = []
+    for wc in workcases:
+        expiration_date = parse_slb_datetime(wc["expirationDate"])
+        if expiration_date < cutoff:
+            continue
+
+        external_id = wc["externalWorkcaseName"]
+        try:
+            history = client.get_workcase_history(external_id)
+        except SlbApiError as exc:
+            log.warning(
+                "%s : impossible de recuperer l'historique pour l'alerte EXPIRED "
+                "(%s), ignore.",
+                external_id,
+                exc,
+            )
+            continue
+
+        if not reached_validate_step(history):
+            continue
+
+        reception_date = parse_reception_date(external_id)
+        gap_days = (
+            (expiration_date.date() - reception_date).days if reception_date else None
+        )
+        alerts.append(ExpiredAlert(external_id, reception_date, expiration_date, gap_days))
+
+    return alerts
 
 
 def confirm_and_compute(client: SlbClient, candidates: list[Candidate]) -> list[Candidate]:
@@ -254,16 +332,47 @@ def run(apply: bool) -> int:
             log.error("%s : echec de la mise a jour : %s", c.external_id, exc)
             errors += 1
 
+    log.info(
+        "Recherche des dossiers EXPIRED recemment expires (fenetre %d jours) ayant "
+        "atteint l'etape de validation avant expiration (alerte non bloquante)...",
+        EXPIRED_ALERT_LOOKBACK_DAYS,
+    )
+    try:
+        expired_alerts = find_expired_validate_alerts(client, EXPIRED_ALERT_LOOKBACK_DAYS)
+    except SlbApiError as exc:
+        log.warning(
+            "Echec de la recherche des dossiers EXPIRED (alerte non bloquante, ignoree) : %s",
+            exc,
+        )
+        expired_alerts = []
+
+    if expired_alerts:
+        log.warning(
+            "ALERTE : %d dossier(s) sont passes EXPIRED alors qu'ils avaient deja "
+            "atteint l'etape '%s' (fenetre %d jours) - etat terminal, NON corrigeable "
+            "via l'API, a traiter/faire remonter manuellement (ils restent consultables "
+            "dans l'historique SLB jusqu'a purge automatique) : %s",
+            len(expired_alerts),
+            step_name,
+            EXPIRED_ALERT_LOOKBACK_DAYS,
+            ", ".join(a.external_id for a in expired_alerts),
+        )
+    else:
+        log.info(
+            "Aucun dossier EXPIRED n'a atteint l'etape de validation sur la fenetre consideree."
+        )
+
     mode = "APPLIQUE" if apply else "DRY-RUN (aucune ecriture)"
     log.info(
         "Resume [%s] : scannes=%d, candidats_date=%d, confirmes=%d, "
-        "mis_a_jour=%d, erreurs=%d",
+        "mis_a_jour=%d, erreurs=%d, dossiers_expires_a_traiter=%d",
         mode,
         len(workcases),
         len(date_candidates),
         len(confirmed),
         updated,
         errors,
+        len(expired_alerts),
     )
     return 1 if errors else 0
 

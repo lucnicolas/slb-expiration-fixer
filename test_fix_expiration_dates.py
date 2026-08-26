@@ -9,6 +9,7 @@ from fix_expiration_dates import (
     format_slb_datetime,
     parse_reception_date,
     parse_slb_datetime,
+    reached_validate_step,
 )
 
 
@@ -132,3 +133,34 @@ def test_format_slb_datetime_strips_milliseconds():
 def test_parse_slb_datetime_handles_milliseconds():
     dt = parse_slb_datetime("2026-08-28T21:59:59.000Z")
     assert dt.year == 2026 and dt.month == 8 and dt.day == 28
+
+
+# --- reached_validate_step : distinction "abandon usager" vs "vraie validation" ---
+
+
+def test_reached_validate_step_true_when_present():
+    history = [
+        {"action": "CreateFolder"},
+        {"action": "StartCollectStep"},
+        {"action": "CompleteCollectStep"},
+        {"action": "StartValidateStep"},
+        {"action": "ExpiredFolder"},
+    ]
+    assert reached_validate_step(history) is True
+
+
+def test_reached_validate_step_false_when_abandoned_by_user():
+    # Cas reel observe : usager depose une partie des pieces, ne soumet jamais,
+    # un traitement automatique (source API) met a jour le statut juste avant
+    # expiration, mais le dossier ne quitte jamais l'etape de collecte.
+    history = [
+        {"action": "CreateFolder"},
+        {"action": "StartCollectStep"},
+        {"action": "UploadDocument", "source": "API"},
+        {"action": "ExpiredFolder"},
+    ]
+    assert reached_validate_step(history) is False
+
+
+def test_reached_validate_step_false_on_empty_history():
+    assert reached_validate_step([]) is False

@@ -31,6 +31,34 @@ attendant le correctif R&D.
 6. Pour les dossiers confirmes : nouvelle date d'expiration = date
    d'expiration actuelle + 15 jours.
 
+## Alerte sur les dossiers deja EXPIRED (non bloquante)
+
+En plus du correctif ci-dessus (qui ne peut agir que sur des dossiers encore
+`OPEN`), le script signale chaque jour les dossiers passes `EXPIRED` dans les
+`EXPIRED_ALERT_LOOKBACK_DAYS` derniers jours (2 par defaut) alors qu'ils
+avaient deja atteint l'etape de validation avant expiration : cas anormal
+identique dans son principe, mais sur un dossier dans un etat terminal que
+l'API refuse de modifier (`403 FORBIDDEN_EXPIRATION_DATE_UPDATE`).
+
+Ces dossiers doivent etre traites/remontes manuellement — ils restent
+consultables dans l'historique SLB jusqu'a la purge automatique cote SLB
+(observee ~5-6 mois apres expiration).
+
+Point important verifie manuellement sur un echantillon reel : un dossier
+`EXPIRED` avec `status = COMPLETE` ou `WITH_ERRORS` n'a **pas** forcement
+atteint l'etape de validation - c'est aussi le cas d'un usager qui depose une
+partie de ses pieces puis abandonne sans jamais soumettre son dossier (un
+traitement automatique cote SLB met alors a jour le statut des pieces sans
+faire avancer le dossier). Le script distingue les deux via l'historique
+(`GET /api/v3/workcases/{id}/history/`), en cherchant l'evenement
+`StartValidateStep` — seul signal fiable de passage reel a l'etape de
+validation.
+
+Cette alerte est **non bloquante** : elle n'affecte jamais le code de sortie
+du script (`dossiers_expires_a_traiter` dans le resume final est purement
+informatif), seule une erreur d'ecriture sur un dossier `OPEN` fait echouer
+le script.
+
 ## Installation
 
 ```bash
@@ -78,3 +106,10 @@ test pour le detail.
   l'appel de detail (`GET /api/v3/workcases/{id}`), pas dans la liste de
   recherche : il n'est donc recupere que pour les dossiers deja identifies
   comme candidats par la regle de date, pour limiter le nombre d'appels API.
+- `state==EXPIRED` seul, dans le filtre de recherche, declenche un bug cote
+  API (`400 Cannot read properties of undefined`) : il faut toujours le
+  combiner avec une 2e clause (le script utilise `currentStepNames==*`).
+- La verification de l'alerte EXPIRED fait un appel `/history/` par dossier
+  recemment expire (pas de concurrence pour rester simple) : avec ~30-60
+  dossiers EXPIRED par jour sur ce tenant, compter jusqu'a ~1-2 minutes
+  d'execution supplementaire pour cette partie.
