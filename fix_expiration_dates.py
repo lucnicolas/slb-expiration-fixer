@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 RECEPTION_THRESHOLD_DAYS = 16
 EXTENSION_DAYS = 15
 STATE_FILTER = "OPEN"
-ALLOWED_STATUSES = {"COMPLETED", "WITH_ERRORS"}
+ALLOWED_STATUSES = {"COMPLETE", "WITH_ERRORS"}  # valeurs reelles renvoyees par l'API (la doc dit "COMPLETED"/"INCOMPLETED", la realite dit "COMPLETE"/"INCOMPLETE")
 ID_PATTERN = re.compile(r"^\w+_(\d{8})_\d+$")
 REQUEST_TIMEOUT = 30
 SEARCH_PAGE_SIZE = 200

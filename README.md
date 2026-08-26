@@ -25,7 +25,9 @@ attendant le correctif R&D.
 4. Si la date d'expiration actuelle est <= ce seuil (comparaison sur la
    date calendaire), le dossier est un candidat.
 5. Verification du statut du dossier (`GET` detail) : uniquement
-   `COMPLETED` ou `WITH_ERRORS` sont traites (`INCOMPLETED` est ignore).
+   `COMPLETE` ou `WITH_ERRORS` sont traites (`INCOMPLETE` est ignore — attention,
+   ce sont les valeurs reellement renvoyees par l'API, qui different de la
+   documentation officielle SLB, laquelle indique a tort `COMPLETED`/`INCOMPLETED`).
 6. Pour les dossiers confirmes : nouvelle date d'expiration = date
    d'expiration actuelle + 15 jours.
 
